@@ -1,0 +1,12 @@
+{
+  "name": "vf-price-api",
+  "version": "1.0.0",
+  "description": "VF 系列价格表查价 Node API（无大模型版）",
+  "main": "api/quote.js",
+  "scripts": {
+    "dev": "node api/quote-local.js"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
