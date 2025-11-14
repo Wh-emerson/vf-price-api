@@ -10,53 +10,64 @@ const WXBizMsgCrypt = require("wxcrypt");
  * ========【这里一定要改成你自己的】========
  * 这三个值必须和企业微信后台配置页完全一致：
  * - token：页面上的 Token
- * - encodingAESKey：页面上的 EncodingAESKey（43 位）
+ * - encodingAESKey：页面上的 EncodingAESKey（必须 43 位）
  * - corpId：企业 ID（“我的企业 → 企业ID”，一般以 ww 开头）
  */
-const token = "hDT3aiyhUvJcjDBOdwjYq921tqF2grw";
-const encodingAESKey = "E4EeBka74EHzQj8K2xkNYWgrwpGgw46UVT5dYWn5Ye7";
+const token = "zFzTonc1nNK0bA6qWRPX38WP";
+const encodingAESKey = "HYq56QNtD9Kvo4bZcMWiyJfq54JCe7EuuhfCpCfCkz1";
 const corpId = "wwaa053cf8eebf4f4a"; // 例：ww1234567890abcdef
 
-// 创建加解密实例
-const cryptor = new WXBizMsgCrypt(token, encodingAESKey, corpId);
+// 为了避免 AESKey 配错时在模块加载阶段就崩掉，封装一个安全创建函数
+function createCryptor() {
+  try {
+    return new WXBizMsgCrypt(token, encodingAESKey, corpId);
+  } catch (e) {
+    console.error("WXBizMsgCrypt init error:", e);
+    return null;
+  }
+}
 
 module.exports = async (req, res) => {
   // -----------------------------
   // ① 企业微信 URL 校验（GET 带 echostr）
   // -----------------------------
-  try {
-    if (req.method === "GET") {
+  if (req.method === "GET") {
+    try {
       const { msg_signature, timestamp, nonce, echostr } = req.query || {};
 
       // 企业微信验证 URL 的 GET 请求：会带 echostr
       if (echostr) {
-        try {
-          // 按官方要求：先验签再解密，得到明文
-          const echo = cryptor.verifyURL(
-            msg_signature,
-            timestamp,
-            nonce,
-            echostr
-          );
+        const cryptor = createCryptor();
 
-          // 必须原样返回明文，不要加引号/JSON
-          return res.status(200).type("text/plain").send(echo);
-        } catch (e) {
-          console.error("verifyURL error:", e);
+        if (cryptor) {
+          try {
+            // 按官方要求：先验签再解密，得到明文
+            const echo = cryptor.verifyURL(
+              msg_signature,
+              timestamp,
+              nonce,
+              echostr
+            );
 
-          // 解密/验签失败时，不要 500 崩溃，至少回原始 echostr
-          // 企业微信这时通常会提示“echostr 校验失败”
-          return res.status(200).type("text/plain").send(echostr);
+            // 必须原样返回明文，不要加引号/JSON
+            return res.status(200).type("text/plain").send(echo);
+          } catch (e) {
+            console.error("verifyURL error:", e);
+            // 解密/验签失败：至少不要 500，先回原始 echostr
+            return res.status(200).type("text/plain").send(echostr);
+          }
         }
+
+        // cryptor 初始化失败（比如 AESKey 长度不对），同样避免 500
+        return res.status(200).type("text/plain").send(echostr);
       }
 
       // 普通 GET（你自己在浏览器打开 /api/quote）就简单回个 ok
       return res.status(200).type("text/plain").send("ok");
+    } catch (e) {
+      console.error("GET handler crashed:", e);
+      return res.status(200).type("text/plain").send("error");
     }
-  } catch (e) {
-    console.error("GET handler crashed:", e);
-    // 再兜底一层，绝不让 Vercel 返回 500
-    return res.status(200).type("text/plain").send("error");
   }
 
   // -----------------------------
