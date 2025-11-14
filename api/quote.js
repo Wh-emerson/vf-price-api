@@ -2,15 +2,21 @@
 const { quote } = require("../price/quote-engine");
 
 module.exports = async (req, res) => {
+  // ① 新增：企业微信验证 URL 时会发 GET
+  if (req.method === "GET") {
+    res.status(200).send("ok");   // 只需要返回 200 + 任意内容即可
+    return;
+  }
+
+  // ② 保留你的原 POST 限制
   if (req.method !== "POST") {
     res.status(405).json({ error: "Only POST is allowed" });
     return;
   }
 
-  // Vercel 默认会帮你解析 JSON body（如果 Content-Type: application/json）
+  // Vercel 默认解析 JSON
   let body = req.body;
   if (!body || typeof body !== "object") {
-    // 兜底：自己再读一遍原始 body 尝试解析
     try {
       const chunks = [];
       for await (const chunk of req) {
@@ -25,7 +31,6 @@ module.exports = async (req, res) => {
   }
 
   const model = (body.model || body.text || "").trim();
-
   if (!model) {
     res.status(400).json({ error: "缺少型号字段 model 或 text" });
     return;
@@ -34,7 +39,6 @@ module.exports = async (req, res) => {
   const result = quote(model);
 
   if (!result.ok) {
-    // 失败时，直接返回错误文本（和你 GPT failure: passthrough 类似）
     res.status(200).json({
       ok: false,
       message: result.error
@@ -42,7 +46,6 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // 成功时返回结构化数据 + 已经排好版的文本
   res.status(200).json({
     ok: true,
     model,
