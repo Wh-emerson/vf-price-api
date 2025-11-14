@@ -1,42 +1,39 @@
 // api/quote.js
 
-// 1. 引入企业微信加解密库
 const WXBizMsgCrypt = require("wxcrypt");
 
+// 这三个请用你的真实值（建议先直接写死，调通再挪到环境变量里）
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
 const CorpID = "wwaa053cf8eebf4f4a"; // ← 必须是企业ID，不是BotID
 
 const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
 
-
-// 4. Vercel Serverless 入口
 module.exports = async function handler(req, res) {
   try {
-    // --- 方便排错：打印一下当前配置（长度，不打印明文AESKey） ---
+    const { method, url, query = {} } = req;
+    const { msg_signature, timestamp, nonce, echostr } = query;
+
     console.log("WX config:", {
       token: TOKEN,
       aesLen: EncodingAESKey.length,
-      receiveId: RECEIVE_ID,
-      method: req.method,
-      path: req.url,
+      receiveId: CorpID,
+      method,
+      path: url,
     });
 
-    // ================================
-    //  A. 企业微信服务器首次 GET 校验
-    // ================================
-    if (req.method === "GET") {
-      const { msg_signature, timestamp, nonce, echostr } = req.query || {};
-
-      // 你在浏览器里随便打开 ?echostr=aaa 的情况
-      if (!echostr) {
-        res.status(200).send("ok");
+    // -----------------------
+    // 1. 企业微信的 URL 校验（GET）
+    // -----------------------
+    if (method === "GET") {
+      // 你自己手动在浏览器打开 /api/quote?echostr=aaa 这种情况
+      if (!msg_signature && echostr && echostr.length < 64) {
+        res.status(200).send(echostr);
         return;
       }
 
-      // 企业微信正式的校验请求：必须带 msg_signature
-      if (!msg_signature) {
-        res.status(200).send("missing signature");
+      if (!echostr) {
+        res.status(200).send("ok");
         return;
       }
 
@@ -47,58 +44,74 @@ module.exports = async function handler(req, res) {
           nonce,
           echostr
         );
-        // 正常情况下返回明文 echostr
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        console.log("verifyURL ok, echostr decrypted:", decrypted);
+        // 按官方要求，回明文字符串即可
         res.status(200).send(decrypted);
       } catch (err) {
         console.error("verifyURL error:", err);
-        // 文档推荐：即便校验失败，也返回原始 echostr，状态码 200
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        // 为了不让企业微信直接判死，返回原 echostr
         res.status(200).send(echostr);
       }
       return;
     }
 
-    // ================================
-    //  B. 企业微信推送消息（POST）
-    // ================================
-    if (req.method === "POST") {
-  let xmlData = "";
-  req.on("data", chunk => (xmlData += chunk));
-  req.on("end", () => {
-    try {
-      const json = JSON.parse(xmlData);   // 企业微信机器人 POST 的内容
-      const encrypted = json.encrypt;
+    // -----------------------
+    // 2. 接收并解密消息（POST）
+    // -----------------------
+    if (method === "POST") {
+      let rawBody = "";
+      req.on("data", (chunk) => (rawBody += chunk));
+      req.on("end", () => {
+        console.log("raw body:", rawBody);
 
-      // 转成 wxcrypt 需要的 XML 格式
-      const wrapXML = `<xml><Encrypt><![CDATA[${encrypted}]]></Encrypt></xml>`;
+        let encrypt;
+        try {
+          // 企业微信机器人发送的是 JSON：{"encrypt":"xxxxx"}
+          const json = JSON.parse(rawBody || "{}");
+          encrypt = json.encrypt;
+        } catch (e) {
+          console.error("JSON parse error:", e);
+        }
 
-      const decrypted = cryptor.decrypt(wrapXML);
-      console.log("decrypted:", decrypted.message);
+        if (!encrypt) {
+          console.error("no encrypt field in body");
+          res.status(200).send("no encrypt");
+          return;
+        }
 
-      res.setHeader("Content-Type", "application/xml");
-      res.status(200).send(`
+        // wxcrypt 只认 XML 里的 <Encrypt>，我们手动包一层
+        const wrapXML = `<xml><Encrypt><![CDATA[${encrypt}]]></Encrypt></xml>`;
+
+        try {
+          const decrypted = cryptor.decrypt(wrapXML);
+          // decrypted 结构一般是 { message: 'xml字符串', id: 'CorpID' }
+          console.log("decrypt success, message:", decrypted.message);
+
+          // TODO: 这里可以把 decrypted.message 解析出来，接你的查价逻辑
+          // 现在先简单回一条欢迎消息
+          const replyXML = `
 <xml>
   <MsgType><![CDATA[markdown]]></MsgType>
   <Markdown>
-    <Content><![CDATA[**VF/VMP 报价助手已上线**\n欢迎使用]]></Content>
+    <Content><![CDATA[**VF/VMP 报价助手已上线**\\n欢迎使用]]></Content>
   </Markdown>
-</xml>
-      `.trim());
-    } catch (err) {
-      console.error("decrypt error:", err);
-      res.status(200).send("decrypt failed");
+</xml>`.trim();
+
+          res.setHeader("Content-Type", "application/xml");
+          res.status(200).send(replyXML);
+        } catch (err) {
+          console.error("decrypt error:", err);
+          // 不要 500，企业微信会一直重试，先 200 告诉它“我收到了”
+          res.status(200).send("decrypt error");
+        }
+      });
+      return;
     }
-  });
-  return;
-}
 
-
-    // 其它方法一律 405
+    // 其它方法直接拒绝
     res.status(405).send("Only GET/POST allowed");
   } catch (e) {
-    console.error("internal error:", e);
-    // 对企业微信来说，最好也返回 200，避免拉黑；这里只留着调试用
-    res.status(200).send("success");
+    console.error("handler fatal error:", e);
+    res.status(500).send("internal error");
   }
 };
