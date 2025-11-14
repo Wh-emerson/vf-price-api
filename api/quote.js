@@ -1,4 +1,5 @@
 const WXBizMsgCrypt = require("wxcrypt");
+const { o2x, x2o } = require("wxcrypt");
 
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
@@ -8,21 +9,21 @@ const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
 
 module.exports = async function handler(req, res) {
   try {
-    //
-    // -----------------------
-    // 1) 企业微信验证（GET）
-    // -----------------------
-    //
     if (req.method === "GET") {
       const { msg_signature, timestamp, nonce, echostr } = req.query || {};
 
-      // 浏览器直接访问（没有 echostr）
+      // 你在浏览器手动打开 ?echostr=aaa 这种，只会带 echostr，属于自测
       if (!echostr) {
         res.status(200).send("ok");
         return;
       }
 
-      // 企业微信验证
+      // 企业微信的校验请求，一定会带 4 个参数
+      if (!msg_signature || !timestamp || !nonce) {
+        res.status(400).send("missing signature");
+        return;
+      }
+
       try {
         const decrypted = cryptor.verifyURL(
           msg_signature,
@@ -30,13 +31,16 @@ module.exports = async function handler(req, res) {
           nonce,
           echostr
         );
-        res.status(200).send(decrypted);
+        res.setHeader("Content-Type", "text/plain");
+        res.status(200).send(decrypted); // 必须原样返回
       } catch (err) {
         console.error("verifyURL error:", err);
-        res.status(200).send(echostr);
+        // 这里不要再硬回 echostr 作弊了，让它失败你才能发现问题
+        res.status(500).send("verify failed");
       }
       return;
     }
+
 
     //
     // -----------------------
@@ -44,49 +48,76 @@ module.exports = async function handler(req, res) {
     // -----------------------
     //
     if (req.method === "POST") {
-      let body = "";
-      req.on("data", chunk => (body += chunk));
-      req.on("end", () => {
-        console.log("raw body:", body);
+      const { msg_signature, timestamp, nonce } = req.query || {};
 
-        // 机器人推送是 JSON，不是 XML！
-        let json;
+      let raw = "";
+      req.on("data", chunk => (raw += chunk));
+      req.on("end", () => {
+        console.log("raw body:", raw);
+
+        let encrypt;
         try {
-          json = JSON.parse(body);
+          const json = JSON.parse(raw);
+          encrypt = json.encrypt;
         } catch (e) {
           console.error("JSON parse error:", e);
-          res.status(200).send("invalid json");
+          res.status(400).send("bad json");
           return;
         }
 
-        const encrypt = json.encrypt;
-        if (!encrypt) {
-          res.status(200).send("missing encrypt");
+        if (!msg_signature || !timestamp || !nonce || !encrypt) {
+          console.error("missing wx params");
+          res.status(400).send("missing wx params");
           return;
         }
 
-        // 解密消息
-        let decrypted;
+        // 拼成 wxcrypt 需要的 xml
+        const xml = `<xml><Encrypt><![CDATA[${encrypt}]]></Encrypt></xml>`;
+
+        let decryptedXml;
         try {
-          decrypted = cryptor.decrypt(encrypt);
-        } catch (e) {
-          console.error("decrypt error:", e);
+          decryptedXml = cryptor.decryptMsg(
+            msg_signature,
+            timestamp,
+            nonce,
+            xml
+          );
+          console.log("decrypted xml:", decryptedXml);
+        } catch (err) {
+          console.error("decryptMsg error:", err);
+          // 这里再看到 -40001，就肯定是三件套不一致
           res.status(200).send("decrypt failed");
           return;
         }
 
-        console.log("decrypted:", decrypted);
+        // 先不细分字段，直接固定回一条 markdown 消息
+        const msg = x2o(decryptedXml).xml;
 
-        //
-        // 给企业微信回复 Markdown（无需加密）
-        //
-        res.setHeader("Content-Type", "application/json");
-        res.status(200).send({
-          msgtype: "markdown",
-          markdown: {
-            content: "**VF/VMP 报价助手已上线**\n你的消息已收到！"
+        const replyObj = {
+          xml: {
+            ToUserName: msg.FromUserName,
+            FromUserName: msg.ToUserName,
+            CreateTime: Math.floor(Date.now() / 1000),
+            MsgType: "markdown",
+            Markdown: {
+              Content:
+                "**VF/VMP 报价助手已上线**\\n" +
+                "你发的内容我已经收到，稍后就会支持查价。"
+            }
           }
-        });
+        };
+
+        const replyPlainXml = o2x(replyObj);
+
+        // 加密回复
+        const encryptedReply = cryptor.encryptMsg(
+          replyPlainXml,
+          String(timestamp),
+          String(nonce)
+        );
+
+        res.setHeader("Content-Type", "application/xml");
+        res.status(200).send(encryptedReply);
       });
 
       return;
@@ -95,6 +126,7 @@ module.exports = async function handler(req, res) {
     res.status(405).send("Only GET/POST allowed");
   } catch (e) {
     console.error(e);
-    res.status(500).send("Internal error");
+    res.status(500).send("internal error");
   }
 };
+
