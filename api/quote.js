@@ -2,35 +2,35 @@
 
 const WXBizMsgCrypt = require("wxcrypt");
 
-// 这三个值务必填成你「机器人详情页」里看到的那一套
-// （就是你刚才截图的 Token / EncodingAESKey / 企业ID）
-const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
+// 这里填「机器人配置详情」里的三样东西
+const TOKEN = "aibJ_SKLyZIzZTlq6lN1sY_lpTKSCZNsGaF";
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
 const CorpID = "wwaa053cf8eebf4f4a";
 
 const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
 
-// 简单取 CDATA 的辅助函数
-function getCData(xml, tag) {
-  const re = new RegExp(`<${tag}><!\\[CDATA\\[(.*?)\\]\\]></${tag}>`);
-  const m = xml.match(re);
-  return m ? m[1] : "";
-}
+// 简单打个日志，确认配置有没有填对长度
+console.log("WX config:", {
+  token: TOKEN,
+  aesLen: EncodingAESKey.length,
+  corpId: CorpID
+});
 
 module.exports = async function handler(req, res) {
   try {
-    // ---------- 1. 企业微信 URL 校验（GET） ----------
+    // ---- 1. URL 校验（GET） ----
     if (req.method === "GET") {
       const { msg_signature, timestamp, nonce, echostr } = req.query || {};
 
-      // 你在浏览器自己点开测试时是没有这些参数的，这种情况直接返回 ok
+      // 你自己在浏览器里敲 ?echostr=aaa 测试的情况：直接回 ok 就行
       if (!echostr) {
         res.status(200).send("ok");
         return;
       }
 
-      if (!msg_signature) {
-        res.status(200).send("missing signature");
+      // 企业微信真正的校验请求会带上 4 个参数
+      if (!msg_signature || !timestamp || !nonce) {
+        res.status(200).send(echostr);
         return;
       }
 
@@ -41,81 +41,104 @@ module.exports = async function handler(req, res) {
           nonce,
           echostr
         );
-        // 按官方要求，返回「解密后的 echostr 明文」
+        // 正常情况，把解出来的明文 echostr 回给企业微信
         res.setHeader("Content-Type", "text/plain");
         res.status(200).send(decrypted);
       } catch (err) {
         console.error("verifyURL error:", err);
-        // URL 校验失败时，官方建议也 200，把原 echostr 返回回去
+        // 校验失败时，企业微信官方建议仍然 200 + 原始 echostr
         res.setHeader("Content-Type", "text/plain");
-        res.status(200).send(echostr || "");
+        res.status(200).send(echostr);
       }
       return;
     }
 
-    // ---------- 2. 收到成员发给机器人的消息（POST） ----------
+    // ---- 2. 收消息 + 被动回复（POST） ----
     if (req.method === "POST") {
       const { msg_signature, timestamp, nonce } = req.query || {};
 
       let xmlData = "";
       req.on("data", (chunk) => (xmlData += chunk));
       req.on("end", () => {
-        (async () => {
-          try {
-            // 2.1 解密收到的消息
-            const decryptedXml = cryptor.decryptMsg(
-              msg_signature,
-              timestamp,
-              nonce,
-              xmlData
-            );
+        console.log("raw xml:", xmlData);
 
-            // 2.2 从明文 XML 里取一些关键信息
-            const fromUser = getCData(decryptedXml, "FromUserName"); // 谁发的
-            const toUser = getCData(decryptedXml, "ToUserName");     // 发给谁
-            const content = getCData(decryptedXml, "Content");       // 文本内容，群聊时可能为空
+        // 2.1 先解密收到的消息
+        let msg;
+        try {
+          msg = cryptor.decryptMsg(
+            msg_signature,
+            timestamp,
+            nonce,
+            xmlData
+          );
+          console.log("decrypted msg:", msg);
+        } catch (err) {
+          console.error("decryptMsg error:", err);
+          // 解密失败也要回 200，避免企业微信一直重试
+          res.status(200).send("success");
+          return;
+        }
 
-            console.log("收到消息：", { fromUser, toUser, content });
+        const now = Math.floor(Date.now() / 1000);
 
-            // 2.3 构造「明文回复 XML」
-            // 注意：被动回复里，要把 To / From 反过来
-            const now = Math.floor(Date.now() / 1000);
-            const replyMarkdown =
-              `**VF/VMP 报价助手已上线**\n` +
-              `你刚才发送：${content || "[非文本消息]"}`;
+        // 企业微信的规范：被动回复时，要把 From/To 互换
+        const toUser = msg.FromUserName;   // 谁发来的
+        const fromUser = msg.ToUserName;   // 机器人这边的标识（企业ID / BotID）
 
-            const replyPlainXml = `
-<xml>
-  <ToUserName><![CDATA[${fromUser}]]></ToUserName>
-  <FromUserName><![CDATA[${toUser}]]></FromUserName>
-  <CreateTime>${now}</CreateTime>
-  <MsgType><![CDATA[markdown]]></MsgType>
-  <Markdown>
-    <Content><![CDATA[${replyMarkdown}]]></Content>
-  </Markdown>
-</xml>`.trim();
+        // 2.2 构造「明文回复」——先按官方 XML 协议写好
+        const plainReply =
+          `<xml>` +
+          `<ToUserName><![CDATA[${toUser}]]></ToUserName>` +
+          `<FromUserName><![CDATA[${fromUser}]]></FromUserName>` +
+          `<CreateTime>${now}</CreateTime>` +
+          `<MsgType><![CDATA[markdown]]></MsgType>` +
+          `<Markdown>` +
+          `<Content><![CDATA[**VF/VMP 报价助手已上线**\n你刚才说：${msg.Content || ""}]]></Content>` +
+          `</Markdown>` +
+          `</xml>`;
 
-            // 2.4 使用加密库加密回复 XML，生成「带 Encrypt/MsgSignature 的最终 XML」
-            const encryptedXml = cryptor.encryptMsg(
-              replyPlainXml,
-              timestamp,
-              nonce
-            );
+        // 2.3 使用 wxcrypt 加密回复
+        let encrypted;
+        try {
+          // 大多数实现是 encryptMsg(plainXml, timestamp, nonce)
+          encrypted = cryptor.encryptMsg(plainReply, timestamp, nonce);
+        } catch (err) {
+          console.error("encryptMsg error:", err);
+          res.status(200).send("success");
+          return;
+        }
 
-            res.setHeader("Content-Type", "application/xml");
-            res.status(200).send(encryptedXml);
-          } catch (err) {
-            console.error("POST decrypt/encrypt error:", err);
-            // 出错时至少返回 200，避免企业微信重复推送
-            res.status(200).send("success");
-          }
-        })();
+        let finalXml;
+
+        // 兼容两种返回形式：字符串 / 对象
+        if (typeof encrypted === "string") {
+          // 有些库直接返回完整的 <xml>...</xml>
+          finalXml = encrypted;
+        } else if (encrypted && encrypted.encrypt && encrypted.msg_signature) {
+          const ts = encrypted.timestamp || timestamp;
+          const nc = encrypted.nonce || nonce;
+          finalXml =
+            `<xml>` +
+            `<Encrypt><![CDATA[${encrypted.encrypt}]]></Encrypt>` +
+            `<MsgSignature><![CDATA[${encrypted.msg_signature}]]></MsgSignature>` +
+            `<TimeStamp>${ts}</TimeStamp>` +
+            `<Nonce><![CDATA[${nc}]]></Nonce>` +
+            `</xml>`;
+        } else {
+          console.error("unexpected encryptMsg result:", encrypted);
+          res.status(200).send("success");
+          return;
+        }
+
+        // 2.4 把加密后的 XML 回给企业微信
+        res.setHeader("Content-Type", "application/xml");
+        res.status(200).send(finalXml);
       });
 
       return;
     }
 
-    // 其它 HTTP 方法不支持
+    // ---- 3. 其它方法不支持 ----
     res.status(405).send("Only GET/POST allowed");
   } catch (e) {
     console.error(e);
