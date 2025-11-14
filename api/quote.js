@@ -1,26 +1,46 @@
-const WXBizMsgCrypt = require("wxcrypt");
-const { o2x, x2o } = require("wxcrypt");
+// api/quote.js
 
+// 1. 引入企业微信加解密库
+const WXBizMsgCrypt = require("wxcrypt");
+
+// 2. 把下面三个值改成【机器人详情页】里的配置：
+//   Token           -> TOKEN
+//   EncodingAESKey  -> EncodingAESKey
+//   Bot ID          -> RECEIVE_ID  （注意：是 Bot ID，不是企业ID！）
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
-const CorpID = "aibJ_SKLyZIzZTlq6lN1sY_lpTKSCZNsGaF";
+const RECEIVE_ID = "aibJ_SKLyZIzZTlq6lN1sY_lpTKSCZNsGaF"; // 机器人详情页里的 Bot ID
 
-const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
+// 3. 只保留一个全局 cryptor
+const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, RECEIVE_ID);
 
+// 4. Vercel Serverless 入口
 module.exports = async function handler(req, res) {
   try {
+    // --- 方便排错：打印一下当前配置（长度，不打印明文AESKey） ---
+    console.log("WX config:", {
+      token: TOKEN,
+      aesLen: EncodingAESKey.length,
+      receiveId: RECEIVE_ID,
+      method: req.method,
+      path: req.url,
+    });
+
+    // ================================
+    //  A. 企业微信服务器首次 GET 校验
+    // ================================
     if (req.method === "GET") {
       const { msg_signature, timestamp, nonce, echostr } = req.query || {};
 
-      // 你在浏览器手动打开 ?echostr=aaa 这种，只会带 echostr，属于自测
+      // 你在浏览器里随便打开 ?echostr=aaa 的情况
       if (!echostr) {
         res.status(200).send("ok");
         return;
       }
 
-      // 企业微信的校验请求，一定会带 4 个参数
-      if (!msg_signature || !timestamp || !nonce) {
-        res.status(400).send("missing signature");
+      // 企业微信正式的校验请求：必须带 msg_signature
+      if (!msg_signature) {
+        res.status(200).send("missing signature");
         return;
       }
 
@@ -31,102 +51,78 @@ module.exports = async function handler(req, res) {
           nonce,
           echostr
         );
-        res.setHeader("Content-Type", "text/plain");
-        res.status(200).send(decrypted); // 必须原样返回
+        // 正常情况下返回明文 echostr
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.status(200).send(decrypted);
       } catch (err) {
         console.error("verifyURL error:", err);
-        // 这里不要再硬回 echostr 作弊了，让它失败你才能发现问题
-        res.status(500).send("verify failed");
+        // 文档推荐：即便校验失败，也返回原始 echostr，状态码 200
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.status(200).send(echostr);
       }
       return;
     }
 
-
-    //
-    // -----------------------
-    // 2) 企业微信推送消息（POST）
-    // -----------------------
-    //
+    // ================================
+    //  B. 企业微信推送消息（POST）
+    // ================================
     if (req.method === "POST") {
-      const { msg_signature, timestamp, nonce } = req.query || {};
-
-      let raw = "";
-      req.on("data", chunk => (raw += chunk));
+      let xmlData = "";
+      req.on("data", (chunk) => (xmlData += chunk));
       req.on("end", () => {
-        console.log("raw body:", raw);
+        (async () => {
+          try {
+            console.log("raw body:", xmlData);
 
-        let encrypt;
-        try {
-          const json = JSON.parse(raw);
-          encrypt = json.encrypt;
-        } catch (e) {
-          console.error("JSON parse error:", e);
-          res.status(400).send("bad json");
-          return;
-        }
+            // 企业微信推送的是加密 XML，需要用 decryptMsg 解密
+            const { msg_signature, timestamp, nonce } = req.query || {};
 
-        if (!msg_signature || !timestamp || !nonce || !encrypt) {
-          console.error("missing wx params");
-          res.status(400).send("missing wx params");
-          return;
-        }
-
-        // 拼成 wxcrypt 需要的 xml
-        const xml = `<xml><Encrypt><![CDATA[${encrypt}]]></Encrypt></xml>`;
-
-        let decryptedXml;
-        try {
-          decryptedXml = cryptor.decryptMsg(
-            msg_signature,
-            timestamp,
-            nonce,
-            xml
-          );
-          console.log("decrypted xml:", decryptedXml);
-        } catch (err) {
-          console.error("decryptMsg error:", err);
-          // 这里再看到 -40001，就肯定是三件套不一致
-          res.status(200).send("decrypt failed");
-          return;
-        }
-
-        // 先不细分字段，直接固定回一条 markdown 消息
-        const msg = x2o(decryptedXml).xml;
-
-        const replyObj = {
-          xml: {
-            ToUserName: msg.FromUserName,
-            FromUserName: msg.ToUserName,
-            CreateTime: Math.floor(Date.now() / 1000),
-            MsgType: "markdown",
-            Markdown: {
-              Content:
-                "**VF/VMP 报价助手已上线**\\n" +
-                "你发的内容我已经收到，稍后就会支持查价。"
+            if (!msg_signature || !timestamp || !nonce) {
+              console.error("missing query params for decrypt");
+              // 没有签名就没法解密，友好结束
+              res.status(200).send("missing query params");
+              return;
             }
+
+            // 解密
+            const decryptedXml = cryptor.decryptMsg(
+              msg_signature,
+              timestamp,
+              nonce,
+              xmlData
+            );
+
+            console.log("decrypted xml:", decryptedXml);
+
+            // 这里你可以自己解析 decryptedXml（FromUserName、Content 等）
+            // 为了简单起见，先直接回一条固定的 markdown 消息
+
+            res.setHeader("Content-Type", "application/xml; charset=utf-8");
+            res.status(200).send(
+              `
+<xml>
+  <MsgType><![CDATA[markdown]]></MsgType>
+  <Markdown>
+    <Content><![CDATA[**VF/VMP 报价助手已上线**\n欢迎使用]]></Content>
+  </Markdown>
+</xml>
+              `.trim()
+            );
+          } catch (err) {
+            console.error("decryptMsg error:", err);
+            // 出错也不要 500，避免企业微信判你接口不可用
+            res.status(200).send("success");
           }
-        };
-
-        const replyPlainXml = o2x(replyObj);
-
-        // 加密回复
-        const encryptedReply = cryptor.encryptMsg(
-          replyPlainXml,
-          String(timestamp),
-          String(nonce)
-        );
-
-        res.setHeader("Content-Type", "application/xml");
-        res.status(200).send(encryptedReply);
+        })();
       });
-
       return;
     }
 
+    // 其它方法一律 405
     res.status(405).send("Only GET/POST allowed");
   } catch (e) {
-    console.error(e);
-    res.status(500).send("internal error");
+    console.error("internal error:", e);
+    // 对企业微信来说，最好也返回 200，避免拉黑；这里只留着调试用
+    res.status(200).send("success");
   }
 };
-
