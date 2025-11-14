@@ -67,56 +67,36 @@ module.exports = async function handler(req, res) {
     //  B. 企业微信推送消息（POST）
     // ================================
     if (req.method === "POST") {
-      let xmlData = "";
-      req.on("data", (chunk) => (xmlData += chunk));
-      req.on("end", () => {
-        (async () => {
-          try {
-            console.log("raw body:", xmlData);
+  let xmlData = "";
+  req.on("data", chunk => (xmlData += chunk));
+  req.on("end", () => {
+    try {
+      const json = JSON.parse(xmlData);   // 企业微信机器人 POST 的内容
+      const encrypted = json.encrypt;
 
-            // 企业微信推送的是加密 XML，需要用 decryptMsg 解密
-            const { msg_signature, timestamp, nonce } = req.query || {};
+      // 转成 wxcrypt 需要的 XML 格式
+      const wrapXML = `<xml><Encrypt><![CDATA[${encrypted}]]></Encrypt></xml>`;
 
-            if (!msg_signature || !timestamp || !nonce) {
-              console.error("missing query params for decrypt");
-              // 没有签名就没法解密，友好结束
-              res.status(200).send("missing query params");
-              return;
-            }
+      const decrypted = cryptor.decrypt(wrapXML);
+      console.log("decrypted:", decrypted.message);
 
-            // 解密
-            const decryptedXml = cryptor.decryptMsg(
-              msg_signature,
-              timestamp,
-              nonce,
-              xmlData
-            );
-
-            console.log("decrypted xml:", decryptedXml);
-
-            // 这里你可以自己解析 decryptedXml（FromUserName、Content 等）
-            // 为了简单起见，先直接回一条固定的 markdown 消息
-
-            res.setHeader("Content-Type", "application/xml; charset=utf-8");
-            res.status(200).send(
-              `
+      res.setHeader("Content-Type", "application/xml");
+      res.status(200).send(`
 <xml>
   <MsgType><![CDATA[markdown]]></MsgType>
   <Markdown>
     <Content><![CDATA[**VF/VMP 报价助手已上线**\n欢迎使用]]></Content>
   </Markdown>
 </xml>
-              `.trim()
-            );
-          } catch (err) {
-            console.error("decryptMsg error:", err);
-            // 出错也不要 500，避免企业微信判你接口不可用
-            res.status(200).send("success");
-          }
-        })();
-      });
-      return;
+      `.trim());
+    } catch (err) {
+      console.error("decrypt error:", err);
+      res.status(200).send("decrypt failed");
     }
+  });
+  return;
+}
+
 
     // 其它方法一律 405
     res.status(405).send("Only GET/POST allowed");
