@@ -3,7 +3,7 @@ const { o2x, x2o } = require("wxcrypt");
 
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
-const CorpID = "wwaa053cf8eebf4f4a";
+const CorpID = "aibJ_SKLyZIzZTlq6lN1sY_lpTKSCZNsGaF";
 
 const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
 
