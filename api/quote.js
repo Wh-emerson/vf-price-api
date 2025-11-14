@@ -3,16 +3,12 @@
 // 1. 引入企业微信加解密库
 const WXBizMsgCrypt = require("wxcrypt");
 
-// 2. 把下面三个值改成【机器人详情页】里的配置：
-//   Token           -> TOKEN
-//   EncodingAESKey  -> EncodingAESKey
-//   Bot ID          -> RECEIVE_ID  （注意：是 Bot ID，不是企业ID！）
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
-const RECEIVE_ID = "aibJ_SKLyZIzZTlq6lN1sY_lpTKSCZNsGaF"; // 机器人详情页里的 Bot ID
+const CorpID = "wwaa053cf8eebf4f4a"; // ← 必须是企业ID，不是BotID
 
-// 3. 只保留一个全局 cryptor
-const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, RECEIVE_ID);
+const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
+
 
 // 4. Vercel Serverless 入口
 module.exports = async function handler(req, res) {
