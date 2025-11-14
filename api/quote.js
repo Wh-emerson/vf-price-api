@@ -1,6 +1,6 @@
 const WXBizMsgCrypt = require("wxcrypt");
 
-const TOKEN = "aibJ_SKLyZIzZTlq6lN1sY_lpTKSCZNsGaF";
+const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
 const CorpID = "wwaa053cf8eebf4f4a";
 
