@@ -4,6 +4,12 @@ const TOKEN = "N3bMPFEvqNUNnWubCo";
 const EncodingAESKey = "3qmvKLU2oBQMAk36ftJJtgMe01IBFwEmD9YzJhDwI61";
 const CorpID = "wwaa053cf8eebf4f4a";
 
+console.log("WX config:", {
+  token: TOKEN,
+  aesLen: EncodingAESKey.length,
+  corpId: CorpID
+});
+
 const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
 
 module.exports = async function handler(req, res) {
