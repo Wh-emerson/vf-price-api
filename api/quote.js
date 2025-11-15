@@ -1,29 +1,20 @@
 // api/quote.js
-// 企业微信「内部智能机器人 · API 模式」回调 + 主动发送回复
-// 1）用 crypto 自己实现回调加解密（按 101031 / 加解密方案）
-// 2）用 101033 的“机器人发送消息 API”主动把回复发回给用户
+// 企业微信「内部智能机器人 · API 模式」回调（按官方 Python3 Demo JSON 版重写）
+// 功能：
+// 1）GET 用于 URL 校验（解密 echostr 返回明文）
+// 2）POST 解密收到的 JSON，读取用户文本，按 msgtype=stream 结构回复
+// 全程只用到 Token + EncodingAESKey，不需要 corpsecret / send_url / access_token
 
 const crypto = require("crypto");
 
 // ===== 1. 机器人回调配置 =====
-// 这两项必须和企业微信后台机器人配置页完全一致
+// 请改成你机器人配置页中看到的 Token / EncodingAESKey
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
-const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj"; // 一定是 43 位
+const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj"; // 必须是 43 位
 // 智能机器人场景 receiveid 为空字符串（官方说明）
 const RECEIVE_ID = "";
 
-// ===== 2. 企业微信「发送消息」所需配置 =====
-// 建议在 Vercel 的 Environment Variables 里配置：WX_CORP_ID / WX_CORP_SECRET / WX_SEND_URL
-// 其中：
-//   WX_CORP_ID      = 企业 ID（管理后台可以看到）
-//   WX_CORP_SECRET  = 智能机器人对应的 Secret（或你为这个机器人开通的那一项）
-//   WX_SEND_URL     = 101033 文档中【机器人发送消息接口】的完整 URL（不含 access_token 参数）
-//                    例如类似： https://qyapi.weixin.qq.com/cgi-bin/aibot/response
-const WX_CORP_ID = process.env.WX_CORP_ID || "";
-const WX_CORP_SECRET = process.env.WX_CORP_SECRET || "";
-const WX_SEND_URL = process.env.WX_SEND_URL || "";
-
-// ===== 3. 签名计算 / 校验 =====
+// ===== 2. 签名计算 / 校验（完全沿用你之前的逻辑） =====
 function calcSignature(token, timestamp, nonce, encrypt) {
   const arr = [token, timestamp, nonce, encrypt].sort();
   return crypto.createHash("sha1").update(arr.join("")).digest("hex");
@@ -34,7 +25,7 @@ function verifySignature(token, timestamp, nonce, encrypt, msgSignature) {
   return sig === msgSignature;
 }
 
-// ===== 4. PKCS#7 补位 / 去补位 =====
+// ===== 3. PKCS#7 补位 / 去补位 =====
 function pkcs7Unpad(buf) {
   const pad = buf[buf.length - 1];
   if (pad < 1 || pad > 32) {
@@ -50,7 +41,7 @@ function pkcs7Pad(buf) {
   return Buffer.concat([buf, padBuf]);
 }
 
-// ===== 5. AES key / 解密 encrypt/echostr =====
+// ===== 4. AES key / 解密 encrypt/echostr =====
 function aesKeyBuf() {
   // EncodingAESKey 43 位，要补一个 "=" 再按 base64 解
   return Buffer.from(EncodingAESKey + "=", "base64");
@@ -76,77 +67,43 @@ function decryptWeCom(encrypt) {
   return { msg, receiveId: rest };
 }
 
-// ===== 6. access_token 获取 & 缓存 =====
-// 标准企业微信 gettoken 接口
-let cachedToken = null;
-let cachedTokenExpiresAt = 0;
+// ===== 5. 加密明文 JSON，生成 encrypt + msgsignature + timestamp + nonce =====
+function encryptWeCom(plainJsonStr, nonceFromReq) {
+  const key = aesKeyBuf();
+  const iv = key.slice(0, 16);
 
-async function getAccessToken() {
-  if (!WX_CORP_ID || !WX_CORP_SECRET) {
-    throw new Error("WX_CORP_ID / WX_CORP_SECRET 未配置");
-  }
+  const random16 = crypto.randomBytes(16);
+  const msgBuf = Buffer.from(plainJsonStr, "utf8");
+  const msgLenBuf = Buffer.alloc(4);
+  msgLenBuf.writeUInt32BE(msgBuf.length, 0);
 
-  const now = Date.now();
-  if (cachedToken && now < cachedTokenExpiresAt) {
-    return cachedToken;
-  }
+  // 明文：16字节随机 + 4字节长度 + msg + receiveId(空字符串)
+  const plainBuf = Buffer.concat([
+    random16,
+    msgLenBuf,
+    msgBuf,
+    Buffer.from(RECEIVE_ID, "utf8"),
+  ]);
 
-  const url =
-    "https://qyapi.weixin.qq.com/cgi-bin/gettoken" +
-    `?corpid=${encodeURIComponent(WX_CORP_ID)}` +
-    `&corpsecret=${encodeURIComponent(WX_CORP_SECRET)}`;
+  const padded = pkcs7Pad(plainBuf);
+  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+  cipher.setAutoPadding(false);
+  const encryptedBuf = Buffer.concat([cipher.update(padded), cipher.final()]);
+  const encrypt = encryptedBuf.toString("base64");
 
-  const resp = await fetch(url);
-  const data = await resp.json();
-  console.log("gettoken result:", data);
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const nonce = nonceFromReq || crypto.randomBytes(8).toString("hex");
+  const msgsignature = calcSignature(TOKEN, timestamp, nonce, encrypt);
 
-  if (data.errcode !== 0) {
-    throw new Error("gettoken failed: " + JSON.stringify(data));
-  }
-
-  cachedToken = data.access_token;
-  // 提前 60 秒过期
-  cachedTokenExpiresAt = now + (data.expires_in - 60) * 1000;
-  return cachedToken;
-}
-
-// ===== 7. 调用 101033 的「机器人发送消息接口」 =====
-async function sendRobotText(eventObj, replyText) {
-  if (!WX_SEND_URL) {
-    throw new Error("WX_SEND_URL 未配置（请填 101033 文档中的发送接口 URL）");
-  }
-
-  const token = await getAccessToken();
-  const url = `${WX_SEND_URL}?access_token=${encodeURIComponent(token)}`;
-
-  // ⚠️ payload 结构请以 101033 文档为准，这里是一个“最合理的猜测模板”
-  // 通常会包含：aibotid、发送对象、消息类型、内容等字段
-  const payload = {
-    aibotid: eventObj.aibotid,          // 回调里带回来的机器人 ID
-    // 下面这几个字段名，你需要对照 101033 文档调整：
-    // 有可能是 touser / open_userid / chatid 等，这里先按最直接的写法占位
-    touser: eventObj.from && eventObj.from.userid,
-    chattype: eventObj.chattype,        // "single" / "group"
-    msgtype: "text",
-    text: {
-      content: replyText,
-    },
+  return {
+    encrypt,
+    msgsignature,
+    timestamp,
+    nonce,
   };
-
-  console.log("sendRobotText payload:", payload);
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json();
-  console.log("sendRobotText result:", data);
-  return data;
 }
 
-// ===== 8. Vercel Handler =====
+// ===== 6. Vercel Handler =====
 module.exports = async function handler(req, res) {
   try {
     const { method, url, query = {} } = req;
@@ -154,10 +111,10 @@ module.exports = async function handler(req, res) {
 
     console.log("Incoming:", { method, url, query });
 
-    // ---------- 8.1 URL 验证（GET） ----------
+    // ---------- 6.1 URL 验证（GET） ----------
     if (method === "GET") {
       if (!echostr) {
-        // 你自己在浏览器打开 /api/quote?xxx 的情况
+        // 你自己浏览器打开 /api/quote?xxx 的情况
         res.status(200).send("ok");
         return;
       }
@@ -171,6 +128,7 @@ module.exports = async function handler(req, res) {
       const ok = verifySignature(TOKEN, timestamp, nonce, echostr, msg_signature);
       if (!ok) {
         console.error("GET verify signature failed");
+        // 按官方建议：仍然 200 返回原串
         res.status(200).send(echostr);
         return;
       }
@@ -187,7 +145,7 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    // ---------- 8.2 接收消息（POST） ----------
+    // ---------- 6.2 接收消息（POST） ----------
     if (method === "POST") {
       let bodyStr = "";
       req.on("data", (chunk) => (bodyStr += chunk));
@@ -244,12 +202,13 @@ module.exports = async function handler(req, res) {
               return;
             }
 
-            // 3）解析事件 JSON
+            // 3）解析事件 JSON（用户发来的消息）
             let eventObj = {};
             try {
               eventObj = JSON.parse(plainMsg);
             } catch (e) {
               console.error("plain msg is not valid JSON:", e);
+              eventObj = {};
             }
 
             // 4）拿到用户发来的文本
@@ -262,22 +221,34 @@ module.exports = async function handler(req, res) {
               userText = eventObj.text.content;
             }
 
-            const replyText = `你刚刚说：${userText || "(空内容)"}`;
-            console.log("replyText:", replyText);
+            // ===== 关键：构造 stream 类型的明文回复（对齐官方 MakeTextStream） =====
+            const streamId =
+              eventObj.msgid ||
+              (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString("hex"));
+            const finish = true;
 
-            // 5）调用 101033 的发送接口，主动把这条消息发回去
-            try {
-              const sendResult = await sendRobotText(eventObj, replyText);
-              console.log("sendRobotText result (final):", sendResult);
-            } catch (e) {
-              console.error("sendRobotText error:", e);
-              // 这里即使失败，也不要让企微重试回调，所以仍然返回 200
-            }
+            const replyPlainObj = {
+              msgtype: "stream",
+              stream: {
+                id: streamId,
+                finish,
+                content: `你刚刚说：${userText || "(空内容)"}`,
+              },
+            };
 
-            // 6）对回调本身，只返回一个简单 200 即可
-            res.status(200).send("ok");
+            const replyPlainStr = JSON.stringify(replyPlainObj);
+            console.log("reply plain (stream):", replyPlainStr);
+
+            // 5）对明文回复进行加密，生成 encrypt + msgsignature + timestamp + nonce
+            const replyPacket = encryptWeCom(replyPlainStr, nonce);
+            console.log("replyPacket:", replyPacket);
+
+            // 6）按官方 demo，用 text/plain 返回 JSON 字符串
+            res.setHeader("Content-Type", "text/plain; charset=utf-8");
+            res.status(200).send(JSON.stringify(replyPacket));
           } catch (e) {
             console.error("POST handler error:", e);
+            // 即便出错也尽量返回 200，避免企微一直重试
             res.status(200).send("");
           }
         })();
