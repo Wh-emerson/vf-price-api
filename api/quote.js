@@ -146,90 +146,106 @@ module.exports = async function handler(req, res) {
     }
 
     // -------- 6.2 接收消息 + 被动回复（POST） --------
-    // 假设前面的部分已经：
-    // 1. 使用 WXBizMsgCrypt 实例 cryptor
-    // 2. 从 query 里取到 msg_signature / timestamp / nonce
-    // 3. 把 body 解密成明文字符串 plainText
-
-    if (req.method === "POST") {
-      let rawBody = "";
-      req.on("data", chunk => (rawBody += chunk));
+    if (method === "POST") {
+      let bodyStr = "";
+      req.on("data", (chunk) => (bodyStr += chunk));
       req.on("end", () => {
-        try {
-          console.log("raw body:", rawBody);
+        (async () => {
+          try {
+            console.log("raw body:", bodyStr);
 
-          // 1. 解密收到的 encrypt
-          const parsed = JSON.parse(rawBody);
-          const encrypt = parsed.encrypt;
-          const { msg_signature, timestamp, nonce } = req.query;
-
-          console.log("WX config:", {
-            token: TOKEN,
-            aesLen: EncodingAESKey.length,
-            receiveId: "", // 智能机器人场景下是空字符串
-            method: req.method,
-            path: req.url,
-            query: req.query
-          });
-
-          const plain = cryptor.decrypt(
-            msg_signature,
-            timestamp,
-            nonce,
-            encrypt
-          );
-
-          console.log("decrypt success, plain msg:", plain);
-
-          const eventObj = JSON.parse(plain);  // 企微发来的明文 JSON
-
-          // 2. 这里先做一个最小可用文本回复
-          let userText = "";
-          if (eventObj.msgtype === "text" && eventObj.text && eventObj.text.content) {
-            userText = eventObj.text.content;
-          }
-
-          const replyPlainObj = {
-            msgtype: "text",
-            text: {
-              // 纯文本先别搞 Markdown，先确认走通
-              content: `你刚刚说：${userText || "(空内容)"}`
+            let encrypt;
+            try {
+              const json = JSON.parse(bodyStr || "{}");
+              encrypt = json.encrypt;
+            } catch (e) {
+              console.error("POST JSON parse error:", e);
+              res.status(200).send("invalid json");
+              return;
             }
-          };
 
-          const replyPlainStr = JSON.stringify(replyPlainObj);
-          console.log("reply plain:", replyPlainStr);
+            if (!encrypt) {
+              console.error("POST missing encrypt");
+              res.status(200).send("missing encrypt");
+              return;
+            }
 
-          // 3. 加密回复
-          const encryptReply = cryptor.encrypt(replyPlainStr);
-          const msgSignatureReply = cryptor.getSignature(
-            timestamp,
-            nonce,
-            encryptReply
-          );
+            if (!msg_signature || !timestamp || !nonce) {
+              console.error("POST missing signature params");
+              res.status(200).send("missing signature");
+              return;
+            }
 
-          const replyPacket = {
-            encrypt: encryptReply,
-            msgsignature: msgSignatureReply,
-            timestamp,
-            nonce
-          };
+            // 1) 校验签名
+            const ok = verifySignature(
+              TOKEN,
+              timestamp,
+              nonce,
+              encrypt,
+              msg_signature
+            );
+            if (!ok) {
+              console.error("POST verify signature failed");
+              res.status(200).send("sig error");
+              return;
+            }
 
-          console.log("reply packet:", replyPacket);
+            // 2) 解密 encrypt 得到明文 JSON 字符串
+            let plainMsg;
+            try {
+              const { msg } = decryptWeCom(encrypt);
+              plainMsg = msg;
+              console.log("decrypt success, plain msg:", plainMsg);
+            } catch (e) {
+              console.error("decrypt error:", e);
+              res.status(200).send("decrypt error");
+              return;
+            }
 
-          // 4. 返回给企微（被动回复）
-          res.setHeader("Content-Type", "application/json");
-          res.status(200).end(JSON.stringify(replyPacket));
-        } catch (e) {
-          console.error("POST handler error:", e);
-          // 即便出错也尽量返回 200，避免企微一直重试
-          res.status(200).end("");
-        }
+            // 明文本身是 JSON 字符串，例如：
+            // { "msgid": "...", "msgtype": "text", "text": { "content": "测试" }, ... }
+            let eventObj;
+            try {
+              eventObj = JSON.parse(plainMsg);
+            } catch (e) {
+              console.error("plain msg is not valid JSON:", e);
+              eventObj = {};
+            }
+
+            // 先做一个最小可用文本回复：原样回你刚刚说的话
+            let userText = "";
+            if (
+              eventObj.msgtype === "text" &&
+              eventObj.text &&
+              typeof eventObj.text.content === "string"
+            ) {
+              userText = eventObj.text.content;
+            }
+
+            const replyPlainObj = {
+              msgtype: "text",
+              text: {
+                content: `你刚刚说：${userText || "(空内容)"}`,
+              },
+            };
+            const replyPlainStr = JSON.stringify(replyPlainObj);
+            console.log("reply plain:", replyPlainStr);
+
+            // 3) 对明文回复进行加密，生成 encrypt + msgsignature + timestamp + nonce
+            const replyPacket = encryptWeCom(replyPlainStr, nonce);
+
+            console.log("replyPacket:", replyPacket);
+
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.status(200).send(replyPacket);
+          } catch (e) {
+            console.error("POST handler error:", e);
+            res.status(200).send("");
+          }
+        })();
       });
-
       return;
     }
-
 
     // 其它方法不支持
     res.status(405).send("Only GET/POST allowed");
