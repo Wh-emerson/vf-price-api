@@ -1,19 +1,21 @@
 // api/quote.js
-// 企业微信「智能机器人 · API 模式」回调 + 被动回复
-// 全程 JSON 加解密（按《回调和回复的加解密方案》）
-// --- 填好 TOKEN / EncodingAESKey 后直接部署 ---
+// 企业微信「智能机器人」回调 & 被动回复
+// 按官方《回调和回复的加解密方案》实现，全部 JSON，加解密用 Node 自带 crypto
 
 const crypto = require("crypto");
 
-// ===== 1. 填你机器人的 Token / EncodingAESKey =================
-const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";              // <- 换成你的
-const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj"; // <- 换成你的（43 位）
-const RECEIVE_ID = ""; // 文档：企业内部智能机器人场景 receiveid 为空字符串
+// ===== 1. 这里填你机器人配置页上的 Token / EncodingAESKey =====
+const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
+const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj"; // 一定是 43 位
+// 智能机器人场景：文档写的是 receiveid 传空字符串
+const RECEIVE_ID = "";
 
-// ===== 2. 签名相关 =================================================
+// ===== 2. 签名计算 / 校验 =====
 function calcSignature(token, timestamp, nonce, encrypt) {
   const arr = [token, timestamp, nonce, encrypt].sort();
-  return crypto.createHash("sha1").update(arr.join("")).digest("hex");
+  const sha1 = crypto.createHash("sha1");
+  sha1.update(arr.join(""));
+  return sha1.digest("hex");
 }
 
 function verifySignature(token, timestamp, nonce, encrypt, msgSignature) {
@@ -21,48 +23,50 @@ function verifySignature(token, timestamp, nonce, encrypt, msgSignature) {
   return sig === msgSignature;
 }
 
-// ===== 3. PKCS7 补位 / 去补位 ======================================
+// ===== 3. PKCS#7 补位 / 去补位 =====
 function pkcs7Unpad(buf) {
   const pad = buf[buf.length - 1];
-  if (pad < 1 || pad > 32) throw new Error("invalid padding");
+  if (pad < 1 || pad > 32) {
+    throw new Error("invalid padding");
+  }
   return buf.slice(0, buf.length - pad);
 }
 
 function pkcs7Pad(buf) {
   const blockSize = 32;
   const pad = blockSize - (buf.length % blockSize || blockSize);
-  return Buffer.concat([buf, Buffer.alloc(pad, pad)]);
+  const padBuf = Buffer.alloc(pad, pad);
+  return Buffer.concat([buf, padBuf]);
 }
 
-// ===== 4. AES key / 解密函数 =======================================
+// ===== 4. AES key / 解密 encrypt/echostr =====
 function aesKeyBuf() {
-  // EncodingAESKey 43 字节，后面补一个 "=" 变成合法 base64
+  // EncodingAESKey 43 位，要补一个 "=" 再按 base64 解
   return Buffer.from(EncodingAESKey + "=", "base64");
 }
 
 function decryptWeCom(encrypt) {
   const key = aesKeyBuf();
   const iv = key.slice(0, 16);
-  const cipherText = Buffer.from(encrypt, "base64");
 
+  const cipherText = Buffer.from(encrypt, "base64");
   const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
   decipher.setAutoPadding(false);
+
   let decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()]);
   decrypted = pkcs7Unpad(decrypted);
 
-  // 16 随机 + 4 长度 + msg + receiveId
+  // 明文结构：16字节随机串 + 4字节msg_len + msg + receiveId
+  const random16 = decrypted.slice(0, 16);
   const msgLen = decrypted.slice(16, 20).readUInt32BE(0);
   const msgBuf = decrypted.slice(20, 20 + msgLen);
   const msg = msgBuf.toString("utf8");
-  const rest = decrypted.slice(20 + msgLen).toString("utf8");
+  const rest = decrypted.slice(20 + msgLen).toString("utf8"); // receiveId
 
-  return {
-    msg,
-    receiveId: rest,
-  };
+  return { random16, msgLen, msg, receiveId: rest };
 }
 
-// ===== 5. 加密回复 ==================================================
+// ===== 5. 加密明文 JSON，返回 encrypt + msgsignature + timestamp + nonce =====
 function encryptWeCom(plainJsonStr, nonceFromReq) {
   const key = aesKeyBuf();
   const iv = key.slice(0, 16);
@@ -72,6 +76,7 @@ function encryptWeCom(plainJsonStr, nonceFromReq) {
   const msgLenBuf = Buffer.alloc(4);
   msgLenBuf.writeUInt32BE(msgBuf.length, 0);
 
+  // 明文：16字节随机 + 4字节长度 + msg + receiveId（智能机器人这里是 ""）
   const plainBuf = Buffer.concat([
     random16,
     msgLenBuf,
@@ -85,6 +90,7 @@ function encryptWeCom(plainJsonStr, nonceFromReq) {
   const encryptedBuf = Buffer.concat([cipher.update(padded), cipher.final()]);
   const encrypt = encryptedBuf.toString("base64");
 
+  // timestamp / nonce / msgsignature
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const nonce = nonceFromReq || crypto.randomBytes(8).toString("hex");
   const msgsignature = calcSignature(TOKEN, timestamp, nonce, encrypt);
@@ -97,179 +103,170 @@ function encryptWeCom(plainJsonStr, nonceFromReq) {
   };
 }
 
-// ===== 6. Vercel Handler ===========================================
+// ===== 6. Vercel Handler =====
 module.exports = async function handler(req, res) {
   try {
     const { method, url, query = {} } = req;
-    // Vercel 把 query 已经帮你 urldecode 了
     const { msg_signature, timestamp, nonce, echostr } = query;
 
     console.log("Incoming:", { method, url, query });
 
-    // ---------- 6.1 URL 验证（保存配置时的 GET） ------------------
+    // ---------- 6.1 URL 验证（GET） ----------
     if (method === "GET") {
+      // 你自己在浏览器打开 /api/quote?echostr=aaa 的情况
       if (!echostr) {
-        // 浏览器手动打开时直接给个 ok
-        res.statusCode = 200;
-        res.end("ok");
+        res.status(200).send("ok");
         return;
       }
 
       if (!msg_signature || !timestamp || !nonce) {
         console.error("GET missing signature params");
-        res.statusCode = 200;
-        res.end(echostr);
+        res.status(200).send(echostr);
         return;
       }
 
-      const sigOk = verifySignature(TOKEN, timestamp, nonce, echostr, msg_signature);
-      if (!sigOk) {
+      const ok = verifySignature(TOKEN, timestamp, nonce, echostr, msg_signature);
+      if (!ok) {
         console.error("GET verify signature failed");
-        // 官方建议：仍然 200 返回原串
-        res.statusCode = 200;
-        res.end(echostr);
+        // 官方推荐也返回 200，这里保守直接回原串
+        res.status(200).send(echostr);
         return;
       }
 
       try {
         const { msg } = decryptWeCom(echostr);
         console.log("GET decrypt echostr success, msg:", msg);
-        res.statusCode = 200;
-        res.end(msg); // 明文直接回
+        // 验证通过：直接返回 msg 明文
+        res.status(200).send(msg);
       } catch (e) {
         console.error("GET decrypt echostr error:", e);
-        res.statusCode = 200;
-        res.end(echostr);
+        res.status(200).send(echostr);
       }
       return;
     }
 
-    // ---------- 6.2 接收消息 + 被动回复（POST） --------------------
+    // ---------- 6.2 接收消息 + 被动回复（POST） ----------
     if (method === "POST") {
       let bodyStr = "";
       req.on("data", (chunk) => (bodyStr += chunk));
       req.on("end", () => {
-        try {
-          console.log("raw body:", bodyStr);
-
-          // 1) 提取 encrypt
-          let encrypt;
+        (async () => {
           try {
-            const json = JSON.parse(bodyStr || "{}");
-            encrypt = json.encrypt;
+            console.log("raw body:", bodyStr);
+
+            // 1) 解析 encrypt
+            let encrypt;
+            try {
+              const json = JSON.parse(bodyStr || "{}");
+              encrypt = json.encrypt;
+            } catch (e) {
+              console.error("POST JSON parse error:", e);
+              res.status(200).send("invalid json");
+              return;
+            }
+
+            if (!encrypt) {
+              console.error("POST missing encrypt");
+              res.status(200).send("missing encrypt");
+              return;
+            }
+
+            if (!msg_signature || !timestamp || !nonce) {
+              console.error("POST missing signature params");
+              res.status(200).send("missing signature");
+              return;
+            }
+
+            // 2) 校验签名
+            const ok = verifySignature(
+              TOKEN,
+              timestamp,
+              nonce,
+              encrypt,
+              msg_signature
+            );
+            if (!ok) {
+              console.error("POST verify signature failed");
+              res.status(200).send("sig error");
+              return;
+            }
+
+            // 3) 解密得到明文 JSON 字符串
+            let plainMsg;
+            try {
+              const { msg } = decryptWeCom(encrypt);
+              plainMsg = msg;
+              console.log("decrypt success, plain msg:", plainMsg);
+            } catch (e) {
+              console.error("decrypt error:", e);
+              res.status(200).send("decrypt error");
+              return;
+            }
+
+            // 4) 解析明文 JSON
+            let eventObj;
+            try {
+              eventObj = JSON.parse(plainMsg);
+            } catch (e) {
+              console.error("plain msg is not valid JSON:", e);
+              eventObj = {};
+            }
+
+            // 提取用户发来的文本
+            let userText = "";
+            if (
+              eventObj.msgtype === "text" &&
+              eventObj.text &&
+              typeof eventObj.text.content === "string"
+            ) {
+              userText = eventObj.text.content;
+            }
+
+            // 5) 构造「明文回复」——先按官方说明带上 aibotid / chattype / from
+            const replyPlainObj = {
+              aibotid: eventObj.aibotid,
+              chattype: eventObj.chattype,
+              from: eventObj.from,
+              msgtype: "text",
+              text: {
+                content: `你刚刚说：${userText || "(空内容)"}`,
+              },
+            };
+            const replyPlainStr = JSON.stringify(replyPlainObj);
+            console.log("reply plain:", replyPlainStr);
+
+            // 6) 加密回复，生成 encrypt + msgsignature + timestamp + nonce
+            const replyPacket = encryptWeCom(replyPlainStr, nonce);
+            console.log("replyPacket:", replyPacket);
+
+            // 自检：把刚才加密好的包再解密一遍，确认没有编码问题
+            try {
+              const check = decryptWeCom(replyPacket.encrypt);
+              console.log("selfCheck decrypt of reply:", {
+                msg: check.msg,
+                receiveId: check.receiveId,
+              });
+            } catch (e) {
+              console.error("selfCheck decrypt error:", e);
+            }
+
+            // 7) 按文档要求返回 JSON
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.status(200).send(replyPacket);
           } catch (e) {
-            console.error("POST JSON parse error:", e);
-            res.statusCode = 200;
-            res.end("invalid json");
-            return;
+            console.error("POST handler error:", e);
+            // 出错也返回 200，避免企业微信疯狂重试
+            res.status(200).send("");
           }
-
-          if (!encrypt) {
-            console.error("POST missing encrypt");
-            res.statusCode = 200;
-            res.end("missing encrypt");
-            return;
-          }
-
-          if (!msg_signature || !timestamp || !nonce) {
-            console.error("POST missing signature params");
-            res.statusCode = 200;
-            res.end("missing signature");
-            return;
-          }
-
-          // 2) 校验签名
-          const sigOk = verifySignature(
-            TOKEN,
-            timestamp,
-            nonce,
-            encrypt,
-            msg_signature
-          );
-          if (!sigOk) {
-            console.error("POST verify signature failed");
-            res.statusCode = 200;
-            res.end("sig error");
-            return;
-          }
-
-          // 3) 解密得到明文 JSON
-          let plainMsg;
-          try {
-            const { msg } = decryptWeCom(encrypt);
-            plainMsg = msg;
-            console.log("decrypt success, plain msg:", plainMsg);
-          } catch (e) {
-            console.error("decrypt error:", e);
-            res.statusCode = 200;
-            res.end("decrypt error");
-            return;
-          }
-
-          let eventObj = {};
-          try {
-            eventObj = JSON.parse(plainMsg);
-          } catch (e) {
-            console.error("plain msg is not valid JSON:", e);
-          }
-
-          // 4) 构造明文回复 —— 带上一些源字段，更接近“官方协议”
-          let userText = "";
-          if (
-            eventObj.msgtype === "text" &&
-            eventObj.text &&
-            typeof eventObj.text.content === "string"
-          ) {
-            userText = eventObj.text.content;
-          }
-
-          const replyPlainObj = {
-            // 这几项是从原消息抄过来的，防止协议要求
-            aibotid: eventObj.aibotid,
-            chattype: eventObj.chattype,
-            from: eventObj.from,
-            // 下发内容
-            msgtype: "text",
-            text: {
-              content: `你刚刚说：${userText || "(空内容)"}`,
-            },
-          };
-
-          const replyPlainStr = JSON.stringify(replyPlainObj);
-          console.log("reply plain:", replyPlainStr);
-
-          // 5) 加密回复
-          const replyPacket = encryptWeCom(replyPlainStr, nonce);
-          console.log("replyPacket:", replyPacket);
-
-          // 5.1 自检：用 decryptWeCom 再解一遍，确认能还原
-          try {
-            const selfCheck = decryptWeCom(replyPacket.encrypt);
-            console.log("selfCheck decrypt of reply:", selfCheck);
-          } catch (e) {
-            console.error("selfCheck decrypt reply error:", e);
-          }
-
-          // 6) 返回给企业微信
-          res.setHeader("Content-Type", "application/json; charset=utf-8");
-          res.statusCode = 200;
-          res.end(JSON.stringify(replyPacket));
-        } catch (e) {
-          console.error("POST handler error:", e);
-          // 官方建议：出错也尽量 200，避免重试
-          res.statusCode = 200;
-          res.end("");
-        }
+        })();
       });
       return;
     }
 
-    // 其它方法直接 405
-    res.statusCode = 405;
-    res.end("Only GET/POST allowed");
+    // 其它方法
+    res.status(405).send("Only GET/POST allowed");
   } catch (e) {
     console.error("handler fatal error:", e);
-    res.statusCode = 500;
-    res.end("internal error");
+    res.status(500).send("internal error");
   }
 };
