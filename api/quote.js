@@ -1,114 +1,232 @@
 // api/quote.js
+// 智能机器人回调 + 被动回复，按官方“回调和回复的加解密方案”实现
+// 全程 JSON，加解密自己用 crypto 实现
 
-const WXBizMsgCrypt = require("wxcrypt");
+const crypto = require("crypto");
 
-// 这三个请用你的真实值（建议先直接写死，调通再挪到环境变量里）
+// ====== 1. 填你机器人页面上的 Token / EncodingAESKey ======
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp";
-const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj";
-const CorpID = "wwaa053cf8eebf4f4a"; // ← 必须是企业ID，不是BotID
+const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj"; // 不要少字符
+// 智能机器人场景，官方文档明确：ReceiveId 为空字符串 ""
+const RECEIVE_ID = "";
 
-const cryptor = new WXBizMsgCrypt(TOKEN, EncodingAESKey, CorpID);
+// ====== 2. 工具函数：签名校验 ======
+function calcSignature(token, timestamp, nonce, encrypt) {
+  const arr = [token, timestamp, nonce, encrypt].sort();
+  const sha1 = crypto.createHash("sha1");
+  sha1.update(arr.join(""));
+  return sha1.digest("hex");
+}
 
+function verifySignature(token, timestamp, nonce, encrypt, msgSignature) {
+  const sig = calcSignature(token, timestamp, nonce, encrypt);
+  return sig === msgSignature;
+}
+
+// ====== 3. 工具函数：PKCS#7 补位/去补位 ======
+function pkcs7Unpad(buf) {
+  const pad = buf[buf.length - 1];
+  if (pad < 1 || pad > 32) {
+    throw new Error("invalid padding");
+  }
+  return buf.slice(0, buf.length - pad);
+}
+
+function pkcs7Pad(buf) {
+  const blockSize = 32;
+  const pad = blockSize - (buf.length % blockSize || blockSize);
+  const padBuf = Buffer.alloc(pad, pad);
+  return Buffer.concat([buf, padBuf]);
+}
+
+// ====== 4. 解密 encrypt / echostr，按企业微信算法 ======
+function aesKeyBuf() {
+  // EncodingAESKey 43 位，需要加一个 "=" 变成标准 Base64
+  return Buffer.from(EncodingAESKey + "=", "base64");
+}
+
+function decryptWeCom(encrypt) {
+  const key = aesKeyBuf();
+  const iv = key.slice(0, 16);
+
+  const cipherText = Buffer.from(encrypt, "base64");
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  decipher.setAutoPadding(false);
+
+  let decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()]);
+  decrypted = pkcs7Unpad(decrypted);
+
+  // 结构：16字节随机串 + 4字节msg_len + msg + receiveId
+  const random16 = decrypted.slice(0, 16);
+  const msgLen = decrypted.slice(16, 20).readUInt32BE(0);
+  const msgBuf = decrypted.slice(20, 20 + msgLen);
+  const msg = msgBuf.toString("utf8");
+  const rest = decrypted.slice(20 + msgLen).toString("utf8"); // receiveId（这里应为空或无视）
+
+  return { random16, msgLen, msg, receiveId: rest };
+}
+
+// ====== 5. 加密明文 JSON 回复，返回 encrypt + msgsignature + timestamp + nonce ======
+function encryptWeCom(plainJsonStr, nonceFromReq) {
+  const key = aesKeyBuf();
+  const iv = key.slice(0, 16);
+
+  const random16 = crypto.randomBytes(16);
+  const msgBuf = Buffer.from(plainJsonStr, "utf8");
+  const msgLenBuf = Buffer.alloc(4);
+  msgLenBuf.writeUInt32BE(msgBuf.length, 0);
+
+  // 明文：16字节随机 + 4字节长度 + msg + receiveId(空字符串)
+  const plainBuf = Buffer.concat([
+    random16,
+    msgLenBuf,
+    msgBuf,
+    Buffer.from(RECEIVE_ID, "utf8"),
+  ]);
+
+  const padded = pkcs7Pad(plainBuf);
+  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+  cipher.setAutoPadding(false);
+  const encryptedBuf = Buffer.concat([cipher.update(padded), cipher.final()]);
+  const encrypt = encryptedBuf.toString("base64");
+
+  // timestamp/nonce & msgsignature
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const nonce = nonceFromReq || crypto.randomBytes(8).toString("hex");
+  const msgsignature = calcSignature(TOKEN, timestamp, nonce, encrypt);
+
+  return {
+    encrypt,
+    msgsignature,
+    timestamp,
+    nonce,
+  };
+}
+
+// ====== 6. Vercel Handler ======
 module.exports = async function handler(req, res) {
   try {
     const { method, url, query = {} } = req;
     const { msg_signature, timestamp, nonce, echostr } = query;
 
-    console.log("WX config:", {
-      token: TOKEN,
-      aesLen: EncodingAESKey.length,
-      receiveId: CorpID,
-      method,
-      path: url,
-    });
+    console.log("Incoming:", { method, url, query });
 
-    // -----------------------
-    // 1. 企业微信的 URL 校验（GET）
-    // -----------------------
+    // -------- 6.1 URL 验证（GET） --------
     if (method === "GET") {
-      // 你自己手动在浏览器打开 /api/quote?echostr=aaa 这种情况
-      if (!msg_signature && echostr && echostr.length < 64) {
-        res.status(200).send(echostr);
-        return;
-      }
-
       if (!echostr) {
         res.status(200).send("ok");
         return;
       }
 
+      // 先验签，再解密 echostr
+      if (!msg_signature || !timestamp || !nonce) {
+        console.error("GET missing signature params");
+        res.status(200).send(echostr);
+        return;
+      }
+
+      const ok = verifySignature(TOKEN, timestamp, nonce, echostr, msg_signature);
+      if (!ok) {
+        console.error("GET verify signature failed");
+        // 文档建议仍然 200 返回明文/原串，这里保守一点直接原样回
+        res.status(200).send(echostr);
+        return;
+      }
+
       try {
-        const decrypted = cryptor.verifyURL(
-          msg_signature,
-          timestamp,
-          nonce,
-          echostr
-        );
-        console.log("verifyURL ok, echostr decrypted:", decrypted);
-        // 按官方要求，回明文字符串即可
-        res.status(200).send(decrypted);
-      } catch (err) {
-        console.error("verifyURL error:", err);
-        // 为了不让企业微信直接判死，返回原 echostr
+        const { msg } = decryptWeCom(echostr);
+        console.log("GET decrypt echostr success, msg:", msg);
+        // 按文档：直接返回 msg（明文）
+        res.status(200).send(msg);
+      } catch (e) {
+        console.error("GET decrypt echostr error:", e);
         res.status(200).send(echostr);
       }
       return;
     }
 
-    // -----------------------
-    // 2. 接收并解密消息（POST）
-    // -----------------------
+    // -------- 6.2 接收消息 + 被动回复（POST） --------
     if (method === "POST") {
-      let rawBody = "";
-      req.on("data", (chunk) => (rawBody += chunk));
+      let bodyStr = "";
+      req.on("data", (chunk) => (bodyStr += chunk));
       req.on("end", () => {
-        console.log("raw body:", rawBody);
+        (async () => {
+          console.log("raw body:", bodyStr);
 
-        let encrypt;
-        try {
-          // 企业微信机器人发送的是 JSON：{"encrypt":"xxxxx"}
-          const json = JSON.parse(rawBody || "{}");
-          encrypt = json.encrypt;
-        } catch (e) {
-          console.error("JSON parse error:", e);
-        }
+          let encrypt;
+          try {
+            const json = JSON.parse(bodyStr || "{}");
+            encrypt = json.encrypt;
+          } catch (e) {
+            console.error("POST JSON parse error:", e);
+            res.status(200).send("invalid json");
+            return;
+          }
 
-        if (!encrypt) {
-          console.error("no encrypt field in body");
-          res.status(200).send("no encrypt");
-          return;
-        }
+          if (!encrypt) {
+            console.error("POST missing encrypt");
+            res.status(200).send("missing encrypt");
+            return;
+          }
 
-        // wxcrypt 只认 XML 里的 <Encrypt>，我们手动包一层
-        const wrapXML = `<xml><Encrypt><![CDATA[${encrypt}]]></Encrypt></xml>`;
+          if (!msg_signature || !timestamp || !nonce) {
+            console.error("POST missing signature params");
+            res.status(200).send("missing signature");
+            return;
+          }
 
-        try {
-          const decrypted = cryptor.decrypt(wrapXML);
-          // decrypted 结构一般是 { message: 'xml字符串', id: 'CorpID' }
-          console.log("decrypt success, message:", decrypted.message);
+          // 1) 校验签名
+          const ok = verifySignature(TOKEN, timestamp, nonce, encrypt, msg_signature);
+          if (!ok) {
+            console.error("POST verify signature failed");
+            res.status(200).send("sig error");
+            return;
+          }
 
-          // TODO: 这里可以把 decrypted.message 解析出来，接你的查价逻辑
-          // 现在先简单回一条欢迎消息
-          const replyXML = `
-<xml>
-  <MsgType><![CDATA[markdown]]></MsgType>
-  <Markdown>
-    <Content><![CDATA[**VF/VMP 报价助手已上线**\\n欢迎使用]]></Content>
-  </Markdown>
-</xml>`.trim();
+          // 2) 解密 encrypt 得到明文 JSON
+          let plainMsg;
+          try {
+            const { msg } = decryptWeCom(encrypt);
+            plainMsg = msg;
+            console.log("decrypt success, plain msg:", plainMsg);
+          } catch (e) {
+            console.error("decrypt error:", e);
+            res.status(200).send("decrypt error");
+            return;
+          }
 
-          res.setHeader("Content-Type", "application/xml");
-          res.status(200).send(replyXML);
-        } catch (err) {
-          console.error("decrypt error:", err);
-          // 不要 500，企业微信会一直重试，先 200 告诉它“我收到了”
-          res.status(200).send("decrypt error");
-        }
+          // 明文本身是 JSON 字符串，例如：
+          // { "msgtype": "...", "text": {...}, ... }
+          let eventObj;
+          try {
+            eventObj = JSON.parse(plainMsg);
+          } catch (e) {
+            console.error("plain msg is not valid JSON:", e);
+            eventObj = {};
+          }
+
+          // 这里先简单处理：不管用户发什么，都回一条 markdown
+          const replyPlainObj = {
+            msgtype: "markdown",
+            markdown: {
+              content: `**VF/VMP 报价助手已上线**\n你的消息我已经收到，后续会接入查价逻辑。`,
+            },
+          };
+          const replyPlainStr = JSON.stringify(replyPlainObj);
+
+          // 3) 对明文回复进行加密，生成 encrypt + msgsignature + timestamp + nonce
+          const replyPacket = encryptWeCom(replyPlainStr, nonce);
+
+          console.log("replyPacket:", replyPacket);
+
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.status(200).send(replyPacket);
+        })();
       });
       return;
     }
 
-    // 其它方法直接拒绝
+    // 其它方法不支持
     res.status(405).send("Only GET/POST allowed");
   } catch (e) {
     console.error("handler fatal error:", e);
