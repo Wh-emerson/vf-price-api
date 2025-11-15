@@ -150,99 +150,87 @@ module.exports = async function handler(req, res) {
       let bodyStr = "";
       req.on("data", (chunk) => (bodyStr += chunk));
       req.on("end", () => {
-        (async () => {
+        try {
+          console.log("raw body:", bodyStr);
+
+          let encrypt;
           try {
-            console.log("raw body:", bodyStr);
-
-            let encrypt;
-            try {
-              const json = JSON.parse(bodyStr || "{}");
-              encrypt = json.encrypt;
-            } catch (e) {
-              console.error("POST JSON parse error:", e);
-              res.status(200).send("invalid json");
-              return;
-            }
-
-            if (!encrypt) {
-              console.error("POST missing encrypt");
-              res.status(200).send("missing encrypt");
-              return;
-            }
-
-            if (!msg_signature || !timestamp || !nonce) {
-              console.error("POST missing signature params");
-              res.status(200).send("missing signature");
-              return;
-            }
-
-            // 1) 校验签名
-            const ok = verifySignature(
-              TOKEN,
-              timestamp,
-              nonce,
-              encrypt,
-              msg_signature
-            );
-            if (!ok) {
-              console.error("POST verify signature failed");
-              res.status(200).send("sig error");
-              return;
-            }
-
-            // 2) 解密 encrypt 得到明文 JSON 字符串
-            let plainMsg;
-            try {
-              const { msg } = decryptWeCom(encrypt);
-              plainMsg = msg;
-              console.log("decrypt success, plain msg:", plainMsg);
-            } catch (e) {
-              console.error("decrypt error:", e);
-              res.status(200).send("decrypt error");
-              return;
-            }
-
-            // 明文本身是 JSON 字符串，例如：
-            // { "msgid": "...", "msgtype": "text", "text": { "content": "测试" }, ... }
-            let eventObj;
-            try {
-              eventObj = JSON.parse(plainMsg);
-            } catch (e) {
-              console.error("plain msg is not valid JSON:", e);
-              eventObj = {};
-            }
-
-            // 先做一个最小可用文本回复：原样回你刚刚说的话
-            let userText = "";
-            if (
-              eventObj.msgtype === "text" &&
-              eventObj.text &&
-              typeof eventObj.text.content === "string"
-            ) {
-              userText = eventObj.text.content;
-            }
-
-            const replyPlainObj = {
-              msgtype: "text",
-              text: {
-                content: `你刚刚说：${userText || "(空内容)"}`,
-              },
-            };
-            const replyPlainStr = JSON.stringify(replyPlainObj);
-            console.log("reply plain:", replyPlainStr);
-
-            // 3) 对明文回复进行加密，生成 encrypt + msgsignature + timestamp + nonce
-            const replyPacket = encryptWeCom(replyPlainStr, nonce);
-
-            console.log("replyPacket:", replyPacket);
-
-            res.setHeader("Content-Type", "application/json; charset=utf-8");
-            res.status(200).send(replyPacket);
+            const json = JSON.parse(bodyStr || "{}");
+            encrypt = json.encrypt;
           } catch (e) {
-            console.error("POST handler error:", e);
-            res.status(200).send("");
+            console.error("POST JSON parse error:", e);
+            res.status(200).send("invalid json");
+            return;
           }
-        })();
+
+          if (!encrypt) {
+            console.error("POST missing encrypt");
+            res.status(200).send("missing encrypt");
+            return;
+          }
+
+          if (!msg_signature || !timestamp || !nonce) {
+            console.error("POST missing signature params");
+            res.status(200).send("missing signature");
+            return;
+          }
+
+          // 1) 校验签名
+          const ok = verifySignature(TOKEN, timestamp, nonce, encrypt, msg_signature);
+          if (!ok) {
+            console.error("POST verify signature failed");
+            res.status(200).send("sig error");
+            return;
+          }
+
+          // 2) 解密 encrypt 得到明文 JSON 字符串
+          let plainMsg;
+          try {
+            const { msg } = decryptWeCom(encrypt);
+            plainMsg = msg;
+            console.log("decrypt success, plain msg:", plainMsg);
+          } catch (e) {
+            console.error("decrypt error:", e);
+            res.status(200).send("decrypt error");
+            return;
+          }
+
+          // 明文本身是 JSON 字符串，例如：
+          // { "msgid": "...", "msgtype": "text", "text": { "content": "测试" }, ... }
+          let eventObj;
+          try {
+            eventObj = JSON.parse(plainMsg);
+          } catch (e) {
+            console.error("plain msg is not valid JSON:", e);
+            eventObj = {};
+          }
+
+          // 先做一个最小可用文本回复：原样回你刚刚说的话
+          let userText = "";
+          if (
+            eventObj.msgtype === "text" &&
+            eventObj.text &&
+            typeof eventObj.text.content === "string"
+          ) {
+            userText = eventObj.text.content;
+          }
+
+          const replyPlainObj = {
+            msgtype: "text",
+            text: {
+              content: `你刚刚说：${userText || "(空内容)"}`,
+            },
+          };
+
+          console.log("reply plain (NO ENCRYPT TEST):", replyPlainObj);
+
+          // ❗测试版：不加密，直接返回明文 JSON
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.status(200).send(replyPlainObj);
+        } catch (e) {
+          console.error("POST handler error:", e);
+          res.status(200).send("");
+        }
       });
       return;
     }
