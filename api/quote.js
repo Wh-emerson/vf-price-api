@@ -8,6 +8,9 @@
 
 const crypto = require("crypto");
 
+const XLSX = require("xlsx");
+
+
 // ===== 1. 机器人回调配置（用你的实际配置替换） =====
 const TOKEN = "h5PEfU4TSE4I7mxLlDyFe9HrfwKp"; // TODO: 替换为企微机器人配置页里的 Token
 const EncodingAESKey = "3Lw2u97MzINbC0rNwfdHJtjuVzIJj4q1Ol5Pu397Pnj"; // TODO: 替换为 43 位 EncodingAESKey
@@ -102,69 +105,346 @@ function encryptWeCom(plainJsonStr, nonceFromReq) {
   };
 }
 
-// ===== 6. 业务逻辑入口：在这里塞“生意逻辑和脑子” =====
+// ===== 6. 查价引擎逻辑（JS 版，来自 quote.py + server.js） =====
+
+// Excel 文件路径（相对项目根目录）
+const XLS_FILE = "VF系列价格表.xlsx";
+
+// 与 Python 版一致的路由/规则配置
+const DEFAULT_SHEETS = [
+  "VF-1", "VFX-1", "VF-VFX-2",
+  "VMP-VMPX-1", "VMP-VMPX-2",
+  "M-MLF", "FFLM", "FF", "MUMP"
+];
+
+const SUFFIX_ENDINGS = [
+  "03LFK", "03LF", "03SFLFK", "03SFLF",
+  "04HTECKLF", "04HTECLF", "07LF", "07LFK"
+];
+
+const M_HEAD_WHITELIST = [
+  "M010", "M015", "M020", "M025", "M032", "M040"
+];
+
+// 读取工作簿（缓存，避免每条消息都重新读一次文件）
+let _workbookCache = null;
+function getWorkbook() {
+  if (_workbookCache) return _workbookCache;
+  _workbookCache = XLSX.readFile(XLS_FILE, { cellDates: false });
+  return _workbookCache;
+}
+
+// normalize：和 Python 版保持一致的清洗逻辑
+function normalize(val) {
+  if (val === null || val === undefined) return "";
+  let s = String(val);
+  const rep = { "，": ",", "。": ".", "．": ".", "・": ".", "　": " " };
+  for (const [k, v] of Object.entries(rep)) {
+    s = s.split(k).join(v);
+  }
+  return s.trim();
+}
+
+// 型号解析：parse_model
+function parseModel(model) {
+  const s = normalize(model);
+  const parts = s.split(".").filter(Boolean);
+  if (parts.length < 2) return { colKey: null, rowKey: null };
+
+  let col, row;
+  if (parts.length === 2) {
+    col = parts[0];
+    row = parts[1];
+  } else if (parts.length === 3) {
+    col = parts[0] + "." + parts[1];
+    row = parts[2];
+  } else if (parts.length === 4) {
+    col = parts[0] + "." + parts[1];
+    row = parts[2] + "." + parts[3];
+  } else {
+    col = parts.slice(0, -2).join(".");
+    row = parts.slice(-2).join(".");
+  }
+  return { colKey: col, rowKey: row };
+}
+
+// 路由 sheet：route_sheets
+function routeSheets(model) {
+  const m = normalize(model).toUpperCase();
+  if (m.startsWith("FFLM")) return ["FFLM"];
+  if (m.startsWith("MUMP")) return ["MUMP"];
+  if (m.startsWith("VF")) return ["VF-1", "VFX-1", "VF-VFX-2"];
+  if (m.startsWith("VMF")) return ["VMP-VMPX-1", "VMP-VMPX-2"];
+  if (m.startsWith("VMP")) return ["VMP-VMPX-1", "VMP-VMPX-2"];
+  if (m.startsWith("VM")) return ["VMP-VMPX-1", "VMP-VMPX-2"];
+  if (m.startsWith("FF")) return ["FF"];
+  if (m.startsWith("M")) return ["M-MLF"];
+  return DEFAULTSHEETS;
+}
+
+// 修正：上面的 DEFAULTSHEETS 拼错，这里再定义一个正确的函数
+function routeSheetsFixed(model) {
+  const m = normalize(model).toUpperCase();
+  if (m.startsWith("FFLM")) return ["FFLM"];
+  if (m.startsWith("MUMP")) return ["MUMP"];
+  if (m.startsWith("VF")) return ["VF-1", "VFX-1", "VF-VFX-2"];
+  if (m.startsWith("VMF")) return ["VMP-VMPX-1", "VMP-VMPX-2"];
+  if (m.startsWith("VMP")) return ["VMP-VMPX-1", "VMP-VMPX-2"];
+  if (m.startsWith("VM")) return ["VMP-VMPX-1", "VMP-VMPX-2"];
+  if (m.startsWith("FF")) return ["FF"];
+  if (m.startsWith("M")) return ["M-MLF"];
+  return DEFAULT_SHEETS;
+}
+
+// 载入某个 sheet，返回 [sheetData, headers, rowKeys]
+// sheetData: 2D 数组，sheetData[rowIndex][colIndex]
+// headers: 第一行列头（已 normalize）
+// rowKeys: 行标（来自第一列）
+function loadSheet(sheetName) {
+  const wb = getWorkbook();
+  const sheet = wb.Sheets[sheetName];
+  if (!sheet) throw new Error("Sheet not found: " + sheetName);
+
+  const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true });
+  if (!aoa || aoa.length === 0) {
+    throw new Error("Empty sheet: " + sheetName);
+  }
+
+  const rawHeaders = aoa[0] || [];
+  const headers = rawHeaders.map(normalize);
+
+  // 行标：第一列，从第 2 行开始
+  function normalizeRow(v) {
+    let x = normalize(v);
+    if (x.endsWith(".0")) x = x.slice(0, -2);
+    return x;
+  }
+
+  const rowKeys = [];
+  for (let i = 1; i < aoa.length; i++) {
+    const row = aoa[i] || [];
+    rowKeys.push(normalizeRow(row[0]));
+  }
+
+  return { sheetData: aoa, headers, rowKeys };
+}
+
+// find_exact：精确匹配 + 兼容 '71' vs '71.0'
+function findExact(list, key) {
+  let k = normalize(key);
+  if (k.endsWith(".0")) k = k.slice(0, -2);
+
+  for (let i = 0; i < list.length; i++) {
+    let v = normalize(list[i]);
+    if (v.endsWith(".0")) v = v.slice(0, -2);
+    if (v === k) return i;
+  }
+  return -1;
+}
+
+// apply_rule：防爆规则
+function applyRule(model, base) {
+  const modelNorm = normalize(model);
+  const headToken = normalize(modelNorm.split(".")[0]).toUpperCase();
+
+  const isVfx = headToken.startsWith("VFX");
+  const isVmpx = headToken.startsWith("VMPX");
+
+  const hitSuffix = SUFFIX_ENDINGS.some(suf => modelNorm.endsWith(suf));
+  const mWhitelistHit = M_HEAD_WHITELIST.includes(headToken);
+
+  if (isVfx) {
+    const adj = base * 1.4;
+    return { rule: "VFX_PREFIX", adjusted: round2(adj) };
+  }
+  if (isVmpx) {
+    const adj = base * 1.5 + 55;
+    return { rule: "VMPX_PREFIX", adjusted: round2(adj) };
+  }
+  if (hitSuffix && mWhitelistHit) {
+    const adj = base * 1.8 + 35;
+    return { rule: "SUFFIX_SET_A", adjusted: round2(adj) };
+  }
+  if (hitSuffix) {
+    const adj = base * 1.8;
+    return { rule: "SUFFIX_SET_B", adjusted: round2(adj) };
+  }
+  return { rule: "NONE", adjusted: round2(base) };
+}
+
+function round2(x) {
+  return Math.round((x + Number.EPSILON) * 100) / 100;
+}
+
+function buildFail(status, reason, extra) {
+  return Object.assign({ status, reason }, extra || {});
+}
+
+// quote_model：完全复刻 Python quote.py 的主逻辑
+function quoteModel(model) {
+  const m = model || "";
+  if (!m.trim()) {
+    return buildFail("FAIL_B", "NO_MODEL_INPUT");
+  }
+
+  const { colKey, rowKey } = parseModel(m);
+  if (!colKey || !rowKey) {
+    return buildFail("FAIL_B", "PARSE_ERROR", { model: m });
+  }
+
+  const sheets = routeSheetsFixed(m);
+
+  for (const sheetName of sheets) {
+    let sheetObj;
+    try {
+      sheetObj = loadSheet(sheetName);
+    } catch (e) {
+      console.error("loadSheet error:", sheetName, e);
+      continue;
+    }
+
+    const { sheetData, headers, rowKeys } = sheetObj;
+    const colIdx = findExact(headers, colKey);
+    const rowIdx = findExact(rowKeys, rowKey);
+
+    if (colIdx < 0 || rowIdx < 0) {
+      // 在当前 sheet 找不到，换下一个 sheet
+      continue;
+    }
+
+    // sheetData 第 0 行是表头，所以数据行从 1 开始
+    const rawRow = sheetData[rowIdx + 1] || [];
+    const cellVal = rawRow[colIdx];
+    const sVal = normalize(cellVal);
+
+    if (!sVal || sVal.toLowerCase() === "nan") {
+      return buildFail("FAIL_A", "EMPTY_CELL", {
+        sheet: sheetName,
+        column_key: colKey,
+        row_key: rowKey
+      });
+    }
+
+    const base = parseFloat(sVal);
+    if (Number.isNaN(base)) {
+      return buildFail("FAIL_A", "NON_NUMERIC_CELL", {
+        sheet: sheetName,
+        column_key: colKey,
+        row_key: rowKey,
+        raw: sVal
+      });
+    }
+
+    const baseRounded = round2(base);
+    const { rule, adjusted } = applyRule(m, baseRounded);
+
+    const baseStr = baseRounded.toFixed(2);
+    const adjStr = adjusted.toFixed(2);
+
+    let formula;
+    if (rule === "VFX_PREFIX") {
+      formula = `(${baseStr} × 1.4) = ${adjStr}`;
+    } else if (rule === "VMPX_PREFIX") {
+      formula = `(${baseStr} × 1.5) + 55 = ${adjStr}`;
+    } else if (rule === "SUFFIX_SET_A") {
+      formula = `(${baseStr} × 1.8) + 35 = ${adjStr}`;
+    } else if (rule === "SUFFIX_SET_B") {
+      formula = `(${baseStr} × 1.8) = ${adjStr}`;
+    } else {
+      formula = `(${baseStr}) = ${adjStr}`;
+    }
+
+    const rate = 12.5;
+    const cny = round2(adjusted * rate);
+
+    return {
+      status: "OK",
+      sheet: sheetName,
+      model: m,
+      column_key: colKey,
+      row_key: rowKey,
+      base_price_eur: baseRounded,
+      adjusted_price_eur: adjusted,
+      rule_applied: rule,
+      rule_formula: formula,
+      sales_multiplier: rate,
+      sales_price_cny: cny
+    };
+  }
+
+  return buildFail("FAIL_B", "NOT_FOUND", {
+    model: m,
+    column_key: colKey,
+    row_key: rowKey
+  });
+}
+
+// 把 JSON 结果转成回复文本（等价于 server.js 里的 formatReply）
+function formatQuoteReply(data) {
+  if (!data || data.status !== "OK") {
+    const r = data || {};
+    return [
+      "未找到对应价格或不允许报价。",
+      r.reason ? `原因: ${r.reason}` : "",
+      r.model ? `型号: ${r.model}` : ""
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    `表：${data.sheet}`,
+    `定位：${data.column_key} × ${data.row_key}`,
+    `原值(EUR)：${data.base_price_eur.toFixed(2)}`,
+    `规则：${data.rule_applied}`,
+    `计算公式：${data.rule_formula}`,
+    `调整后(EUR)：${data.adjusted_price_eur.toFixed(2)}`,
+    `销售价格系数：${data.sales_multiplier}`,
+    `销售价格(CNY)：${data.sales_price_cny.toFixed(2)}`
+  ].join("\n");
+}
+
+// ===== 7. 业务逻辑入口：在这里塞“生意逻辑和脑子” =====
 // eventObj: 企微解密后的完整 JSON
 // userText: 用户发来的文本内容（string）
 async function runBusinessLogic(eventObj, userText) {
   // 1）空消息兜底
   if (!userText || !userText.trim()) {
-    return "请发送要查询的型号或问题，例如：VF040.02X.33.30LA 或 “帮我查价 VF040.02X.33.30LA”。";
+    return "请发送要查询的型号或问题，例如：VF040.02X.33.30LA 或 “查价 VMP010.03XKSF.71”。";
   }
 
   const text = userText.trim();
 
-  // 2）简单指令示例：输入 “帮助”
+  // 2）帮助指令
   if (text === "帮助" || text.toLowerCase() === "help") {
     return [
-      "👋 我是 VF/VMP 报价助手（测试版）。你可以这样用我：",
+      "👋 我是 VF/VMP 报价助手（查价逻辑已接入 Excel）。",
       "",
+      "用法示例：",
       "1）直接发型号：",
-      "   例如：VF040.02X.33.30LA",
+      "   VF040.02X.33.30LA",
+      "   VMP010.03XKSF.71",
       "",
-      "2）带说明的指令：",
-      "   例如：查价 VMP010.03XKSF.71",
+      "2）带前缀说明也行：",
+      "   查价 VF040.02X.33.30LA",
       "",
-      "3）若我看不懂，就会原样重复你的内容，方便你检查格式。",
+      "我会在《VF系列价格表.xlsx》中严格定位列头/行标，套防爆规则，给出 EUR 与 CNY 售价。",
     ].join("\n");
   }
 
-  // 3）简单型号识别示例（你可以以后改成更严谨的正则）
-  //   检测是否疑似减速机型号，后续在这里调用你的查价引擎 / API
-  const modelPattern = /\b(VF|VFX|VMP|VMPX|M|FV|WM)[A-Za-z0-9\.\-]*/;
-  const modelMatch = text.match(modelPattern);
+  // 3）尝试从文本中提取型号
+  //   这里先简单一点：把整行当型号丢进去，让 quoteModel 自己判定。
+  const model = text;
 
-  if (modelMatch) {
-    const model = modelMatch[0];
+  const quoteResult = quoteModel(model);
+  const replyText = formatQuoteReply(quoteResult);
 
-    // ===== TODO：在这里调用你的实际查价逻辑 =====
-    // 例：调用你未来的 Vercel / Railway / 本地报价 API
-    //
-    // const resp = await fetch("https://你的报价API地址/quote", {
-    //   method: "POST",
-    //   headers: { "Content-Type": "application/json" },
-    //   body: JSON.stringify({ model }),
-    // });
-    // const data = await resp.json();
-    //
-    // 然后组织成返回文案：
-    // return `型号：${model}\n欧元价：${data.eur} EUR\n人民币售价：${data.cny} CNY`;
-
-    // 这里先给你一个占位实现，等你把报价 API 搭好再替换：
-    return [
-      `检测到型号：${model}`,
-      "",
-      "此处应该调用你的报价引擎（Excel / Python / API），",
-      "返回：基础价、折扣后售价、人民币售价等明细。",
-      "",
-      "目前还是占位实现，你可以在 quote.js 的 runBusinessLogic 里，",
-      "把“占位实现”这一段换成真实查价调用。",
-    ].join("\n");
+  // 如果完全没匹配到（NOT_FOUND / PARSE_ERROR），再加一句提示
+  if (quoteResult.status !== "OK") {
+    return replyText + "\n\n（提示：请检查型号格式是否与 Excel 表头/行标一致）";
   }
 
-  // 4）默认兜底：当普通聊天问问题时，可以接 GPT / FAQ / 自定义逻辑
-  // 现在先简单回声，后续你可以在这里接你自己的 GPT API。
-  return `你刚刚说：${text}\n\n（目前是测试版：未匹配到型号指令，就先原样复读。）`;
+  return replyText;
 }
+
 
 // ===== 7. Vercel Handler =====
 module.exports = async function handler(req, res) {
