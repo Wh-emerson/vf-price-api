@@ -10,7 +10,7 @@ const crypto = require("crypto");
 const path = require("path");
 const XLSX = require("xlsx");
 
-// Excel 和 quote.js 在同一目录（api/）下
+// Excel 放在和 quote.js 同一目录（api/）下
 const XLS_FILE = path.join(__dirname, "VF系列价格表.xlsx");
 
 

@@ -11,10 +11,5 @@
       "src": "/api/quote",
       "dest": "/api/quote.js"
     }
-  ],
-  "functions": {
-    "api/quote.js": {
-      "includeFiles": "VF系列价格表.xlsx"
-    }
-  }
+  ]
 }
