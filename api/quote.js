@@ -7,8 +7,9 @@
 // 全程只用 Token + EncodingAESKey，不需要 corpsecret / send_url / access_token。
 
 const crypto = require("crypto");
-
+const path = require("path");
 const XLSX = require("xlsx");
+
 
 
 // ===== 1. 机器人回调配置（用你的实际配置替换） =====
@@ -107,8 +108,6 @@ function encryptWeCom(plainJsonStr, nonceFromReq) {
 
 // ===== 6. 查价引擎逻辑（JS 版，来自 quote.py + server.js） =====
 
-// Excel 文件路径（相对项目根目录）
-const XLS_FILE = "VF系列价格表.xlsx";
 
 // 与 Python 版一致的路由/规则配置
 const DEFAULT_SHEETS = [
