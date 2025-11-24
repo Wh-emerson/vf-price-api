@@ -149,7 +149,8 @@ function normalize(val) {
 
 // 型号解析：parse_model
 function parseModel(model) {
-  const s = normalize(model);
+  // 先做 normalize（去全角、空格），再统一转大写
+  const s = normalize(model).toUpperCase();
   const parts = s.split(".").filter(Boolean);
   if (parts.length < 2) return { colKey: null, rowKey: null };
 
@@ -170,6 +171,7 @@ function parseModel(model) {
   return { colKey: col, rowKey: row };
 }
 
+
 // 路由 sheet：route_sheets
 function routeSheets(model) {
   const m = normalize(model).toUpperCase();
@@ -185,8 +187,14 @@ function routeSheets(model) {
 }
 
 // 修正：上面的 DEFAULTSHEETS 拼错，这里再定义一个正确的函数
+// 小工具：统一做 normalize + 大写
+function normalizeModel(model) {
+  return normalize(model).toUpperCase();
+}
+
 function routeSheetsFixed(model) {
-  const m = normalize(model).toUpperCase();
+  const m = normalizeModel(model);  // 等价于你现在那一行
+
   if (m.startsWith("FFLM")) return ["FFLM"];
   if (m.startsWith("MUMP")) return ["MUMP"];
   if (m.startsWith("VF")) return ["VF-1", "VFX-1", "VF-VFX-2"];
@@ -197,6 +205,7 @@ function routeSheetsFixed(model) {
   if (m.startsWith("M")) return ["M-MLF"];
   return DEFAULT_SHEETS;
 }
+
 
 // 载入某个 sheet，返回 [sheetData, headers, rowKeys]
 // sheetData: 2D 数组，sheetData[rowIndex][colIndex]
@@ -233,20 +242,23 @@ function loadSheet(sheetName) {
 
 // find_exact：精确匹配 + 兼容 '71' vs '71.0'
 function findExact(list, key) {
-  let k = normalize(key);
+  // 统一大写，避免大小写差异导致找不到
+  let k = normalize(key).toUpperCase();
   if (k.endsWith(".0")) k = k.slice(0, -2);
 
   for (let i = 0; i < list.length; i++) {
-    let v = normalize(list[i]);
+    let v = normalize(list[i]).toUpperCase();
     if (v.endsWith(".0")) v = v.slice(0, -2);
     if (v === k) return i;
   }
   return -1;
 }
 
+
 // apply_rule：防爆规则
 function applyRule(model, base) {
-  const modelNorm = normalize(model);
+  // 这里也统一成大写，后面的 endsWith / includes 全部走大写逻辑
+  const modelNorm = normalize(model).toUpperCase();
   const headToken = normalize(modelNorm.split(".")[0]).toUpperCase();
 
   const isVfx = headToken.startsWith("VFX");
